@@ -1,43 +1,38 @@
-import discord
-import os
-import asyncio
-from discord.ext import commands
 from .utils.dataIO import fileIO
-from random import randint
 from .utils import checks
 from __main__ import send_cmd_help
+
+import discord
+from discord.ext import commands
+from random import randint
 from cogs.economy import check_folders
+
+import os
+import asyncio
+import logging
+
+LOGGER = "data/blackjack/blckjck-logs.log"
+
 
 
 class Blackjack:
-    """Blackjack economy addition cog"""
 
     def __init__(self, bot):
         self.bot = bot
-        self.bank = fileIO("data/economy/bank.json", "load")
-        self.settings = fileIO("data/economy/settings.json", "load")
+        self.eco_api = bot.get_cog('Economy').bank
+        self.settings = fileIO("data/blackjack/settings.json", "load")
+
+        self.logger = logging.getLogger("blckjck-logs")
+
+        if self.logger.level == 0:
+            self.logger.setLevel(logging.INFO)
+            handler = logging.FileHandler(filename=LOGGER, encoding='utf-8', mode='a')
+            handler.setFormatter(logging.Formatter('%(asctime)s %(message)s', datefmt="[%d/%m/%Y %H:%M]"))
+            self.logger.addHandler(handler)
 
         self.game_state = "null"
         self.timer = 0
         self.players = {}
-        
-        """
-        self.players
-            player_name
-                "hand"
-                    0 (hand number)
-                        "card"
-                            0 (card number)
-                                "rank"
-                                "suit"
-                                "value"
-                        "ranks"
-                        "bet"
-                        "standing"
-                        "blackjack"
-                "curr_hand"
-            *dealer*
-        """
 
         self.deck = {}
 
@@ -47,7 +42,7 @@ class Blackjack:
                 self.deck[suit][i] = {}
                 self.deck[suit][i]["rank"] = str(i)
                 self.deck[suit][i]["value"] = i
-            
+
             self.deck[suit][1] = {}
             self.deck[suit][1]["rank"] = "ace"
             self.deck[suit][1]["value"] = 11
@@ -64,23 +59,24 @@ class Blackjack:
             self.deck[suit][13]["rank"] = "king"
             self.deck[suit][13]["value"] = 10
 
-    @commands.group(pass_context=True, no_pm=True)
-    async def blackjack(self, ctx):
+
+    @commands.group(pass_context=True,no_pm=True,name="blackjack", aliases=["bj"])
+    async def _blackjack(self, ctx):
         """Play some blackjack"""
         if ctx.invoked_subcommand is None:
             await send_cmd_help(ctx)
 
-    @blackjack.command(pass_context=True, no_pm=True)
+
+    @_blackjack.command(pass_context=True, no_pm=True)
     async def start(self, ctx):
         """Start a game of blackjack"""
-
         if self.game_state == "null":
             self.game_state = "pregame"
             await self.blackjack_game(ctx)
         else:
             await self.bot.say("A blackjack game is already in progress!")
 
-    @blackjack.command(pass_context=True, no_pm=True)
+    @_blackjack.command(pass_context=True, no_pm=True)
     @checks.admin_or_permissions(manage_server=True)
     async def stop(self, ctx):
         """Stop the current game of blackjack (no refunds)"""
@@ -91,23 +87,24 @@ class Blackjack:
             self.game_state = "null"
             await self.bot.say("**Blackjack has been stopped**")
 
-    @blackjack.command(pass_context=True, no_pm=True)
+
+    @_blackjack.command(pass_context=True, no_pm=True)
     async def bet(self, ctx, bet: int):
         """Join the game of blackjack with your opening bet"""
         player = ctx.message.author
 
-        if self.enough_money(player.id, bet) and self.game_state == "pregame":
+        if self.eco_api.can_spend(player, bet) and self.game_state == "pregame":
             if bet < self.settings["BLACKJACK_MIN"] or (bet > self.settings["BLACKJACK_MAX"] and self.settings["BLACKJACK_MAX_ENABLED"]):
                 await self.bot.say("{0}, bet must be between {1} and {2}.".format(player.mention, self.settings["BLACKJACK_MIN"], self.settings["BLACKJACK_MAX"]))
             else:
                 if not (player in self.players.keys()):
                     await self.bot.say("{0} has placed a bet of {1}".format(player.mention, bet))
-                    self.withdraw_money(player.id, bet)
+                    self.eco_api.withdraw_credits(player, bet)
 
                 else:
                     await self.bot.say("{0} has placed a new bet of {1}".format(player.mention, bet))
-                    self.add_money(player.id, bet)
-                    self.withdraw_money(player.id, bet)
+                    self.eco_api.deposit_credits(player, bet)
+                    self.eco_api.withdraw_credits(player, bet)
 
                 self.players[player] = {}
                 self.players[player]["curr_hand"] = 0
@@ -118,18 +115,23 @@ class Blackjack:
                 self.players[player]["hand"][0]["bet"] = bet
                 self.players[player]["hand"][0]["standing"] = False
                 self.players[player]["hand"][0]["blackjack"] = False
-                
-        
+
+                await self.bot.say("{0} has a balance of: {1}".format(player.mention, self.eco_api.get_balance(player)))
+
         elif self.game_state == "null":
             await self.bot.say("There is currently no game running, type `/blackjack start` to begin one")
-        
+
         elif self.game_state != "pregame" and self.game_state != "null":
             await self.bot.say("There is currently a game in progress, wait for the next game")
 
-        elif not self.enough_money(player.id, bet):
+        elif not self.eco_api.can_spend(player, bet):
             await self.bot.say("{0}, you need an account with enough funds to play blackjack".format(player.mention))
 
-    @blackjack.command(pass_context=True, no_pm=True)
+    @commands.command(pass_context=True, no_pm=True, name="bet")
+    async def _clean_bet(self,ctx,bt: int):
+        await ctx.invoke(self.bet, bt)
+
+    @_blackjack.command(pass_context=True, no_pm=True)
     async def hit(self, ctx):
         """Hit and draw another card"""
         player = ctx.message.author
@@ -140,11 +142,11 @@ class Blackjack:
         count = await self.count_hand(player, curr_hand)
 
         if self.game_state == "game" and self.players[player]["hand"][curr_hand]["standing"] == False:
-            
+
             if count > 21 and len(self.players[player]["hand"]) == self.players[player]["curr_hand"] + 1:
                 await self.bot.say("{0} has **busted**!".format(player.mention))
                 self.players[player]["hand"][curr_hand]["standing"] = True
-            
+
             elif count > 21 and len(self.players[player]["hand"]) > self.players[player]["curr_hand"] + 1:
                 await self.bot.say("{0} has **busted** on their current hand! Moving on to next split hand!".format(player.mention))
                 self.players[player]["curr_hand"] += 1
@@ -158,21 +160,27 @@ class Blackjack:
 
         elif self.game_state != "game":
             await self.bot.say("{0}, you cannot hit right now".format(player.mention))
-        
+
         elif self.players[player]["hand"][curr_hand]["standing"]:
             await self.bot.say("{0}, you are standing and cannot hit".format(player.mention))
 
-    @blackjack.command(pass_context=True, no_pm=True)
+
+    @commands.command(pass_context=True, no_pm=True, name="hit")
+    async def _clean_hit(self,ctx):
+        await ctx.invoke(self.hit)
+
+
+    @_blackjack.command(pass_context=True, no_pm=True, name="stand", aliases=["stay"])
     async def stand(self, ctx):
         """Finishing drawing and stand with your current cards"""
         player = ctx.message.author
         curr_hand = self.players[player]["curr_hand"]
         if self.game_state == "game" and not self.players[player]["hand"][curr_hand]["standing"]:
             count = await self.count_hand(player, self.players[player]["curr_hand"])
-            
+
             if len(self.players[player]["hand"]) == self.players[player]["curr_hand"] + 1:
                 await self.bot.say("{0} has stood with a hand totaling to {1}".format(player.mention, str(count)))
-            
+
             else:
                 await self.bot.say("{0} has stood with a hand totaling to {1}. Moving on to next split hand!".format(player.mention, str(count)))
                 self.players[player]["curr_hand"] += 1
@@ -181,31 +189,35 @@ class Blackjack:
 
         elif self.game_state != "game":
             await self.bot.say("{0}, you cannot stand right now".format(player.mention))
-        
+
         elif self.players[player]["hand"][curr_hand]["standing"]:
             await self.bot.say("{0}, you are already standing".format(player.mention))
 
 
-    @blackjack.command(pass_context=True, no_pm=True)
+    @commands.command(pass_context=True, no_pm=True, name="stand", aliases=["stay"])
+    async def _clean_stand(self,ctx):
+        await ctx.invoke(self.stand)
+
+    @_blackjack.command(pass_context=True, no_pm=True)
     async def double(self, ctx):
         """Double your original bet and draw one last card"""
         player = ctx.message.author
         curr_hand = self.players[player]["curr_hand"]
         bet = self.players[player]["hand"][curr_hand]["bet"]
 
-        if self.enough_money(player.id, bet) and not self.players[player]["hand"][curr_hand]["standing"] and self.game_state == "game":
+        if self.eco_api.can_spend(player, bet) and not self.players[player]["hand"][curr_hand]["standing"] and self.game_state == "game":
             await self.bot.say("{0} has doubled down, totaling their bet to {1}".format(player.mention, self.players[player]["hand"][curr_hand]["bet"]))
 
             self.players[player]["hand"][curr_hand]["bet"] += bet
-            self.withdraw_money(player.id, bet)
-            
+            self.eco_api.withdraw_credits(player, bet)
+
             card = await self.draw_card(player)
             count = await self.count_hand(player, self.players[player]["curr_hand"])
 
             if count > 21 and len(self.players[player]["hand"]) == self.players[player]["curr_hand"] + 1:
                 await self.bot.say("{0} has **busted**!".format(player.mention))
                 self.players[player]["hand"][curr_hand]["standing"] = True
-            
+
             elif count > 21 and len(self.players[player]["hand"]) > self.players[player]["curr_hand"] + 1:
                 await self.bot.say("{0} has **busted**! Moving on to next split hand!".format(player.mention))
                 self.players[player]["curr_hand"] += 1
@@ -225,16 +237,19 @@ class Blackjack:
 
         elif self.players[player]["hand"][curr_hand]["standing"]:
             await self.bot.say("{0}, you are standing and cannot double!".format(player.mention))
-        
-        elif not self.enough_money(player.id, bet):
-            await self.bot.say("{0}, you do not have enough money to double down!".format(player.mention))
-        
 
-    @blackjack.command(pass_context=True, no_pm=True)
+        elif not self.eco_api.can_spend(player, bet):
+            await self.bot.say("{0}, you do not have enough money to double down!".format(player.mention))
+
+    @commands.command(pass_context=True, no_pm=True, name="double")
+    async def _clean_double(self,ctx):
+        await ctx.invoke(self.double)
+
+    @_blackjack.command(pass_context=True, no_pm=True)
     async def split(self, ctx):
         """Split your hand into two seperate hands if you have two cards of the same rank"""
         player = ctx.message.author
-        
+
         curr_hand = self.players[player]["curr_hand"]
         cards = self.players[player]["hand"][curr_hand]["card"]
 
@@ -244,11 +259,11 @@ class Blackjack:
 
             cards[1]["value"] = 11
             cards[1]["rank"] = "ace"
-        
+
         if cards[0]["value"] == cards[1]["value"] and len(cards) == 2 and self.game_state == "game" and not self.players[player]["hand"][curr_hand]["standing"]:
             await self.bot.say("{0} has split their {1}'s! Play through your first hand and stand to begin your next!".format(player.mention, cards[0]["value"]))
             hand_index = len(self.players[player]["hand"])
-            
+
             self.players[player]["hand"][hand_index] = {}
             self.players[player]["hand"][hand_index]["card"] = {}
             self.players[player]["hand"][hand_index]["ranks"] = []
@@ -267,10 +282,14 @@ class Blackjack:
 
         elif len(cards) != 2:
             await self.bot.say("{0}, you may only split with two cards!".format(player.mention))
-  
+
         elif cards[0]["value"] != cards[1]["value"]:
             await self.bot.say("{0}, you may only split with two cards of the same value!".format(player.mention))
 
+
+    @commands.command(pass_context=True, no_pm=True, name="split")
+    async def _clean_split(self,ctx):
+        await ctx.invoke(self.split)
 
     async def blackjack_game(self, ctx):
         while self.game_state != "null":
@@ -289,9 +308,9 @@ class Blackjack:
 
             if self.game_state == "drawing":
                 for player in self.players:
-                    
+
                     card1 = await self.draw_card(player)
-                    card2 = await self.draw_card(player)    
+                    card2 = await self.draw_card(player)
 
                     curr_hand = self.players[player]["curr_hand"]
                     ranks = self.players[player]["hand"][curr_hand]["ranks"]
@@ -307,7 +326,7 @@ class Blackjack:
 
                     else:
                         await self.bot.say("{0} has drawn a {1} and a {2}, totaling to {3}!".format(player.mention, card1, card2, str(count)))
-                    
+
                     await asyncio.sleep(1)
 
                 self.players["dealer"] = {}
@@ -318,10 +337,10 @@ class Blackjack:
                 self.players["dealer"]["hand"][0]["ranks"] = []
 
                 card = await self.draw_card("dealer")
-                
+
                 if self.settings["BLACKJACK_IMAGES_ENABLED"]:
-                    await self.bot.upload("data\economy\playing_cards\hidden_card.png")
-                
+                    await self.bot.upload("data\\blackjack\playing_cards\hidden_card.png")
+
                 await self.bot.say("**The dealer has drawn a {0}!**".format(card))
                 self.game_state = "game"
 
@@ -354,15 +373,15 @@ class Blackjack:
                     else:
                         await self.bot.say("**The dealer has drawn a {0}, totaling his hand to {1}!**".format(card, str(dealer_count)))
 
-                
+
                 if blackjack: #if dealer has blackjack
                     await self.bot.say("**The dealer has a blackjack!**")
-                    
+
                     for player in self.players:
                         if player != "dealer":
                             for hand in self.players[player]["hand"]:
                                 if self.players[player]["hand"][hand]["blackjack"]:
-                                    self.add_money(player.id, self.players[player]["hand"][hand]["bet"])
+                                    self.eco_api.deposit_credits(player, self.players[player]["hand"][hand]["bet"])
                                     await self.bot.say("{0} ties dealer and pushes!".format(player.mention))
                                 else:
                                     await self.bot.say("{0} loses with a score of {1}".format(player.mention, str(count)))
@@ -377,14 +396,14 @@ class Blackjack:
                             for hand in self.players[player]["hand"]:
                                 count = await self.count_hand(player, hand)
                                 if self.players[player]["hand"][hand]["blackjack"]:
-                                    self.add_money(player.id, self.players[player]["hand"][hand]["bet"] * 2.5)
+                                    self.eco_api.deposit_credits(player, self.players[player]["hand"][hand]["bet"] * 2.5)
                                     await self.bot.say("{0} beats dealer with a blackjack and wins **{2}**!".format(player.mention, str(count), self.players[player]["hand"][hand]["bet"] * 1.5))
                                 elif count <= 21:
-                                    self.add_money(player.id, self.players[player]["hand"][hand]["bet"] * 2)
+                                    self.eco_api.deposit_credits(player, self.players[player]["hand"][hand]["bet"] * 2)
                                     await self.bot.say("{0} doesn't bust with a score of {1} and wins **{2}**!".format(player.mention, str(count), self.players[player]["hand"][hand]["bet"]))
                                 else:
                                     await self.bot.say("{0} busted and wins nothing".format(player.mention))
-                    
+
                     self.game_state = "pregame"
                     await asyncio.sleep(3)
 
@@ -395,21 +414,26 @@ class Blackjack:
                             for hand in self.players[player]["hand"]:
                                 count = await self.count_hand(player, hand)
                                 if self.players[player]["hand"][hand]["blackjack"]:
-                                    self.add_money(player.id, self.players[player]["hand"][hand]["bet"] * 2.5)
+                                    self.eco_api.deposit_credits(player, self.players[player]["hand"][hand]["bet"] * 2.5)
                                     await self.bot.say("{0} beats dealer with a blackjack and wins **{2}**!".format(player.mention, str(count), self.players[player]["hand"][hand]["bet"] * 1.5))
                                 elif count > 21:
                                     await self.bot.say("{0} busted and wins nothing".format(player.mention))
                                 elif count > dealer_count:
-                                    self.add_money(player.id, self.players[player]["hand"][hand]["bet"] * 2)
+                                    self.eco_api.deposit_credits(player, self.players[player]["hand"][hand]["bet"] * 2)
                                     await self.bot.say("{0} beats dealer with a score of {1} and wins **{2}**!".format(player.mention, str(count), self.players[player]["hand"][hand]["bet"]))
                                 elif count == dealer_count:
-                                    self.add_money(player.id, self.players[player]["hand"][hand]["bet"])
+                                    self.eco_api.deposit_credits(player, self.players[player]["hand"][hand]["bet"])
                                     await self.bot.say("{0} ties dealer and pushes!".format(player.mention))
                                 else:
                                     await self.bot.say("{0} loses with a score of {1}".format(player.mention, str(count)))
 
                     self.game_state = "pregame"
                     await asyncio.sleep(3)
+
+                if self.game_state == "pregame":
+                    for player in self.players:
+                        if player != "dealer":
+                            await self.bot.say("{0} now has a balance of: {1}".format(player.mention, self.eco_api.get_balance(player)))
 
     async def draw_card(self, player):
         suit = randint(1, 4)
@@ -438,7 +462,7 @@ class Blackjack:
         await self.count_hand(player, curr_hand) #to change ace names and values in the "ranks" table, don't actually need the count
 
         if self.settings["BLACKJACK_IMAGES_ENABLED"]:
-            await self.bot.upload("data\economy\playing_cards\\" + rank + "_of_" + suit + ".png")
+            await self.bot.upload("data\\blackjack\playing_cards\\" + rank + "_of_" + suit + ".png")
 
         if rank == "small_ace":
             rank = "ace"
@@ -463,8 +487,15 @@ class Blackjack:
                     for card in self.players[player]["hand"][curr_hand]["card"]:
                         self.players[player]["hand"][curr_hand]["ranks"].append(self.players[player]["hand"][curr_hand]["card"][card]["rank"])
                     break
-
         return count
+
+    # async def delete_messages(self, ctx):
+    #     server = ctx.message.server
+    #     user = ctx.message.server.me
+    #     message = ctx.message
+    #     if x.author.id == user.id:
+    #         await self.bot.delete_message(x)
+    #     await self.bot.delete_message(cmdmsg)
 
 
     @commands.group(pass_context=True, no_pm=True)
@@ -484,14 +515,14 @@ class Blackjack:
         """Minimum blackjack bet"""
         self.settings["BLACKJACK_MIN"] = bet
         await self.bot.say("Minimum bet is now " + str(bet) + " credits.")
-        fileIO("data/economy/settings.json", "save", self.settings)
+        fileIO("data/blackjack/settings.json", "save", self.settings)
 
     @blackjackset.command()
     async def blackjackmax(self, bet : int):
         """Maximum blackjack bet"""
         self.settings["BLACKJACK_MAX"] = bet
         await self.bot.say("Maximum bet is now " + str(bet) + " credits.")
-        fileIO("data/economy/settings.json", "save", self.settings)
+        fileIO("data/blackjack/settings.json", "save", self.settings)
 
     @blackjackset.command()
     async def blackjackmaxtoggle(self):
@@ -502,21 +533,21 @@ class Blackjack:
         else:
             await self.bot.say("Maximum bet is now disabled.")
 
-        fileIO("data/economy/settings.json", "save", self.settings)
+        fileIO("data/blackjack/settings.json", "save", self.settings)
 
     @blackjackset.command()
     async def blackjackpretime(self, time : int):
         """Set the pregame time for players to bet"""
         self.settings["BLACKJACK_PRE_GAME_TIME"] = time
         await self.bot.say("Blackjack pre-game time is now " + str(time))
-        fileIO("data/economy/settings.json", "save", self.settings)
+        fileIO("data/blackjack/settings.json", "save", self.settings)
 
     @blackjackset.command()
     async def blackjacktime(self, time : int):
         """Set the maximum game time given to hit"""
         self.settings["BLACKJACK_GAME_TIME"] = time
         await self.bot.say("Blackjack maximum game time is now " + str(time))
-        fileIO("data/economy/settings.json", "save", self.settings)
+        fileIO("data/blackjack/settings.json", "save", self.settings)
 
     @blackjackset.command()
     async def blackjackimagestoggle(self):
@@ -527,60 +558,21 @@ class Blackjack:
         else:
             await self.bot.say("Card images are now disabled.")
 
-        fileIO("data/economy/settings.json", "save", self.settings)
-    
+        fileIO("data/blackjack/settings.json", "save", self.settings)
+
     @blackjackset.command()
     async def paydaytime(self, seconds : int):
         """Seconds between each payday"""
         self.settings["PAYDAY_TIME"] = seconds
         await self.bot.say("Value modified. At least " + str(seconds) + " seconds must pass between each payday.")
-        fileIO("data/economy/settings.json", "save", self.settings)
+        fileIO("data/blackjack/settings.json", "save", self.settings)
 
     @blackjackset.command()
     async def paydaycredits(self, credits : int):
         """Credits earned each payday"""
         self.settings["PAYDAY_CREDITS"] = credits
         await self.bot.say("Every payday will now give " + str(credits) + " credits.")
-        fileIO("data/economy/settings.json", "save", self.settings)
-
-
-    def account_check(self, id):
-        if id in self.bank:
-            return True
-        else:
-            return False
-
-    def check_balance(self, id):
-        if self.account_check(id):
-            return self.bank[id]["balance"]
-        else:
-            return False
-
-    def add_money(self, id, amount):
-        if self.account_check(id):
-            self.bank[id]["balance"] = self.bank[id]["balance"] + int(amount)
-            fileIO("data/economy/bank.json", "save", self.bank)
-        else:
-            return False
-
-    def withdraw_money(self, id, amount):
-        if self.account_check(id):
-            if self.bank[id]["balance"] >= int(amount):
-                self.bank[id]["balance"] = self.bank[id]["balance"] - int(amount)
-                fileIO("data/economy/bank.json", "save", self.bank)
-            else:
-                return False
-        else:
-            return False
-
-    def enough_money(self, id, amount):
-        if self.account_check(id):
-            if self.bank[id]["balance"] >= int(amount):
-                return True
-            else:
-                return False
-        else:
-            return False
+        fileIO("data/blackjack/settings.json", "save", self.settings)
 
 
 def check_files():
@@ -593,9 +585,9 @@ def check_files():
         "BLACKJACK_IMAGES_ENABLED" : True
     }
 
-    f = "data/economy/settings.json"
+    f = "data/blackjack/settings.json"
     if not fileIO(f, "check"):
-        print("Creating default economy's settings.json...")
+        print("Creating default blackjack's settings.json...")
         fileIO(f, "save", settings)
     else: #consistency check
         current = fileIO(f, "load")
